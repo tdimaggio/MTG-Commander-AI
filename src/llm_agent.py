@@ -2,153 +2,94 @@ import requests
 import json
 import pandas as pd
 from typing import List, Dict, Any, Optional
+import re
 
 # --- Configuration ---
 # Ollama runs on localhost:11434 by default.
+# NOTE: These are defined as GLOBAL constants, not self attributes.
 OLLAMA_URL = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "deepseek-coder:6.7b" # Your installed Ollama model
 
 class OllamaAgent:
     """
-    Manages communication with the local DeepSeek Coder model via the Ollama API.
+    Manages communication with the local DeepSeek Coder model via the Ollama API
+    to return structured JSON commands instead of card names.
     """
-
     def __init__(self, model_name: str = OLLAMA_MODEL):
         self.model_name = model_name
 
-    def _format_card_data(self, card_df: pd.DataFrame, commander_name: str, owned_cards: List[str]) -> str:
+    def _parse_json_response(self, text: str) -> Optional[Dict[str, str]]:
         """
-        Formats a subset of the DataFrame into a highly structured string 
-        that the LLM can easily understand and use for reasoning.
+        Extracts and parses the command JSON object from the LLM's response.
+        We expect a JSON object like: {"function": "select_cards", "strategy": "Goblin Tribal"}
         """
-        # Select key columns useful for synergy reasoning
-        columns_to_include = ['Name', 'ManaValue', 'ColorIdentity', 'Type', 'Text', 'Keywords']
+        # Look for a JSON object structure enclosed in curly braces { ... }
+        match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
         
-        # --- Filtering for Context ---
-        # 1. Find the Commander's color identity to filter the card pool
-        commander_info = card_df[card_df['Name'] == commander_name].iloc[0]
-        commander_colors = commander_info['ColorIdentity']
+        if match:
+            raw_json_str = match.group(0).strip()
+            
+            # 2. Attempt to parse the cleaned string into a Python dictionary
+            try:
+                command = json.loads(raw_json_str)
+                # Basic validation to ensure it looks like a command
+                if isinstance(command, dict) and 'function' in command and 'strategy' in command:
+                    return command
+            except json.JSONDecodeError as e:
+                print(f"DEBUG: Failed to decode command JSON. Error: {e}")
+                return None
         
-        # 2. Filter down the list to include only cards matching the Commander's color identity
-        def passes_color_check(colors):
-            # If the card has a color identity (list of characters), check if all match the Commander's colors.
-            # If the card is colorless (empty list/None), it's always legal.
-            if isinstance(colors, list) and colors:
-                return all(c in commander_colors for c in colors)
-            return True # Allow colorless/artifacts
+        return None
 
-        filtered_df = card_df[card_df['ColorIdentity'].apply(passes_color_check)].copy()
-        
-        # 3. Prioritize owned cards for the sample
-        
-        # Create a list of the intersection: owned cards that are also legal
-        owned_legal_cards_df = filtered_df[filtered_df['Name'].isin(owned_cards)]
-        
-        # Calculate how many suggestions we need (we aim for 10 suggestions total)
-        # For simplicity, we sample 200 cards in the final pool to give the AI variety
-        
-        # Take all owned legal cards (up to 50 for the context prompt)
-        owned_sample = owned_legal_cards_df.sample(n=min(50, len(owned_legal_cards_df)), random_state=42)
-        
-        # Take a random sample of non-owned, legal cards to fill the rest of the 200 context slots
-        non_owned_df = filtered_df[~filtered_df['Name'].isin(owned_cards)]
-        non_owned_sample_size = min(150, len(non_owned_df))
-        non_owned_sample = non_owned_df.sample(n=non_owned_sample_size, random_state=42)
-
-        # Combine the two samples to create the final pool context
-        final_sample_df = pd.concat([owned_sample, non_owned_sample]).drop_duplicates(subset=['Name'])
-
-        # Convert the DataFrame sample to a string table for the prompt
-        card_table_str = final_sample_df[columns_to_include].to_markdown(index=False)
-        
-        return f"""
-Commander Name: {commander_name}
-Commander Colors: {commander_colors}
-Commander Text: {commander_info['Text']}
-
-USER'S OWNED COLLECTION (Must be prioritized if synergistic): {len(owned_legal_cards_df)} unique cards owned that are legal.
-
-CARD POOL DATA (Total {len(final_sample_df)} unique cards):
-{card_table_str}
-"""
-
-    def generate_suggestions(self, card_df: pd.DataFrame, commander_name: str, owned_cards: List[str]) -> Optional[List[str]]:
+    def get_strategy_command(self, commander_name: str, commander_color_identity: str) -> Optional[Dict[str, str]]:
         """
-        Sends a request to the local Ollama server (DeepSeek Coder) to generate a decklist,
-        prioritizing cards from the owned_cards list.
+        Queries the LLM for a structured command outlining the deck strategy.
         """
         
-        card_pool_context = self._format_card_data(card_df, commander_name, owned_cards)
+        system_prompt = (
+            "You are an expert Magic: The Gathering Commander deck builder. "
+            "Your sole task is to determine the core synergistic strategy for the Commander. "
+            "Respond ONLY with a single, valid JSON object that defines the function to call and the strategy. "
+            "Do NOT include any commentary, prose, or markdown fences (```)."
+        )
 
-        # The core prompt: instructing DeepSeek Coder to act as a card synergy expert
-        prompt = f"""
-You are an expert Magic: The Gathering (MTG) Commander deck-building assistant.
-Your goal is to suggest 10 highly synergistic cards for a deck led by the Commander provided below.
-
-**CRITICAL INSTRUCTION:**
-- The suggested cards MUST come directly from the CARD POOL DATA provided.
-- **Prioritize cards that are explicitly present in the CARD POOL DATA and are part of the USER'S OWNED COLLECTION.** This is a budget constraint.
-- Ensure the selection includes a balance of card types (Ramp, Removal, Card Draw).
-- Output ONLY a clean, markdown-formatted JSON array of the card names. DO NOT include any explanatory text, commentary, or markdown outside the final JSON block.
-
-{card_pool_context}
-
-Output the suggested card names as a JSON array (list of strings):
-"""
+        user_prompt = (
+            f"COMMANDER: {commander_name} (Color Identity: {commander_color_identity}). "
+            "Based on this card, what is the single best, most synergistic deck strategy? "
+            "Define the strategy concisely (e.g., 'Voltron', 'Lifegain', 'Artifact Ramp')."
+        )
         
-        headers = {'Content-Type': 'application/json'}
+        # Example to force the model into the required output format
+        function_schema = (
+            'The required output format is a JSON object defining the function call:\n'
+            '{"function": "select_cards", "strategy": "<CONCISE_STRATEGY_HERE>"}'
+        )
+
         payload = {
             "model": self.model_name,
-            "prompt": prompt,
+            "prompt": f"{system_prompt}\n{function_schema}\n\nUSER COMMAND: {user_prompt}",
             "stream": False,
+            "format": "json", # CRITICAL FIX: Ollama's native way to enforce JSON output
             "options": {
-                "temperature": 0.3, # Lower temperature for more deterministic/logical output
-                "top_k": 40,
-                "top_p": 0.9,
+                "temperature": 0.1, # Very low temperature for highly deterministic output
+                "num_predict": 1024
             }
         }
 
         try:
-            print(f"Querying Ollama model '{self.model_name}' at {OLLAMA_URL}...")
-            # We don't use the simple requests.post here, we'll use a fetch implementation with retries.
+            # FIX: Access OLLAMA_URL as a global constant
+            response = requests.post(OLLAMA_URL, json=payload, timeout=30)
+            response.raise_for_status()
             
-            # --- API Call Logic (Replace with actual fetch in running environment) ---
-            # NOTE: For local environment testing, this block simulates the API call.
-            # In a real environment, you would use 'requests' as initially defined.
+            response_json = response.json()
+            full_response_text = response_json.get('response', '')
+            
+            # Parse the response to extract the command
+            return self._parse_json_response(full_response_text)
 
-            response = requests.post(OLLAMA_URL, headers=headers, data=json.dumps(payload), timeout=120)
-            response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-            
-            # The response text contains the LLM output
-            full_response_text = response.json().get('response', '').strip()
-            
-            # --- Parsing Logic ---
-            # Find the JSON block (often wrapped in ```json ... ```)
-            start_index = full_response_text.find('[')
-            end_index = full_response_text.rfind(']')
-            
-            if start_index != -1 and end_index != -1:
-                json_string = full_response_text[start_index : end_index + 1]
-                
-                # Attempt to parse the JSON string
-                try:
-                    suggested_cards: List[str] = json.loads(json_string)
-                    # Filter out non-strings just in case of weird LLM output
-                    return [card for card in suggested_cards if isinstance(card, str)]
-                except json.JSONDecodeError:
-                    print("\n[ERROR] Failed to parse JSON output from LLM.")
-                    print(f"Raw LLM Output (first 200 chars): {full_response_text[:200]}...")
-                    return None
-            else:
-                print("\n[ERROR] Could not find JSON output in LLM response.")
-                print(f"Raw LLM Output (first 200 chars): {full_response_text[:200]}...")
-                return None
-                
         except requests.exceptions.ConnectionError:
-            print("\n[FATAL ERROR] Could not connect to Ollama server.")
-            print("Please ensure Ollama is running and the 'deepseek-coder:6.7b' model is loaded.")
-            print("Run 'ollama run deepseek-coder:6.7b' in your Terminal to check.")
+            print("❌ ERROR: Could not connect to Ollama server.")
             return None
-        except requests.exceptions.RequestException as e:
-            print(f"\n[ERROR] An error occurred during the request to Ollama: {e}")
+        except Exception as e:
+            print(f"❌ An unexpected error occurred during command generation: {e}")
             return None

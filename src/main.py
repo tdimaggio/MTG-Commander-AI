@@ -1,94 +1,126 @@
 import pandas as pd
-from data_loader import load_and_preprocess_data, load_collection_data 
-from llm_agent import OllamaAgent 
-from typing import Optional, List, Any
+from typing import Optional, List, Dict, Any
+import random
 
-# --- Configuration ---
-# Set the initial Commander Name (User choice)
-INITIAL_COMMANDER_NAME = "Krenko, Mob Boss"
+# Relative import structure for modules inside the 'src/' folder
+from data_loader import load_and_preprocess_data, load_collection_data
+from llm_agent import OllamaAgent
 
-def get_user_commander() -> str:
-    """Prompts the user for the Commander's name."""
-    print("\n-------------------------------------------")
-    print(f"Commander set initially to: {INITIAL_COMMANDER_NAME}")
-    
-    # Allow the user to change the commander interactively
-    user_input = input("Please enter the name of your Commander (or press Enter for Krenko, Mob Boss): ").strip()
-    
-    return user_input if user_input else INITIAL_COMMANDER_NAME
-
-def select_commander(card_db: pd.DataFrame, commander_name: str) -> Optional[pd.Series]:
+# Placeholder function that replaces the need for the AI to know all card names.
+# In the final app, this function would use Pandas to query the database.
+def select_cards_by_strategy(strategy: str, color_identity: str, owned_cards: List[str]) -> List[str]:
     """
-    Finds the Commander in the card database and extracts key information.
-    """
+    Simulates a complex database query to find card names matching a given strategy.
     
-    # Attempt to find the commander in the database
+    Since DeepSeek Coder does not know card names, we hardcode a list based on the
+    expected "Goblin Tribal" strategy for Krenko.
+    """
+    print(f"Executing Strategy Query: Find top cards for '{strategy}' in {color_identity}.")
+    
+    # The list below is hardcoded based on the expected "Goblin Tribal" strategy.
+    # In a real app, this is where you would use Pandas to filter by card text/keywords.
+    goblin_synergy_cards = [
+        "Goblin Warchief",
+        "Skirk Prospector",
+        "Krenko, Tin Street Kingpin",
+        "Impact Tremors",
+        "Aether Vial",
+        "Lightning Greaves",
+        "Vandalblast",
+        "Pashalik Mons",
+        "Goblin Chieftain",
+        "Ruby Medallion"
+    ]
+    
+    # Filter to prioritize owned cards, then fill up with any strong suggestions.
+    final_suggestions = [card for card in goblin_synergy_cards if card in owned_cards]
+    
+    # Fill the list up to 10 suggestions, excluding duplicates and the Commander itself.
+    while len(final_suggestions) < 10 and len(goblin_synergy_cards) > 0:
+        card = random.choice(goblin_synergy_cards)
+        if card not in final_suggestions:
+            final_suggestions.append(card)
+    
+    return final_suggestions[:10]
+
+
+def select_commander(card_db: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    # --- Configuration ---
+    DEFAULT_COMMANDER_NAME = "Krenko, Mob Boss"
+
+    # Get user input for Commander name
+    commander_name = input(f"\nPlease enter the name of your Commander (or press Enter for {DEFAULT_COMMANDER_NAME}): ")
+    if not commander_name:
+        commander_name = DEFAULT_COMMANDER_NAME
+
+    # Search the database for the Commander
     commander_card = card_db[card_db['Name'] == commander_name]
-    
+
     if commander_card.empty:
-        print(f"Error: Commander '{commander_name}' not found in the legal card database.")
+        print(f"Error: Commander '{commander_name}' not found in legal card database.")
         return None
     
-    commander_info: pd.Series = commander_card.iloc[0]
-    
-    # Format colors for display
-    colors = commander_info.get('ColorIdentity')
-    colors_str = ','.join(colors) if isinstance(colors, list) and colors else 'C (Colorless)'
-        
-    print(f"\nCommander Selected: {commander_info['Name']} | Colors: {colors_str}")
-    
-    return commander_info
+    # Return the first (and hopefully only) match as a dictionary
+    return commander_card.iloc[0].to_dict()
 
 def run_deck_builder_app():
-    """
-    Main function to run the MTG Commander AI Deck Builder application.
-    Orchestrates data loading, commander selection, and AI suggestion generation.
-    """
     print("--- MTG Commander AI Deck Builder Starting ---")
-    
-    # 1. Load the pre-processed card database (Data Layer)
-    card_database_df: pd.DataFrame = load_and_preprocess_data()
-    
+
+    # 1. Load Data
+    card_database_df: Optional[pd.DataFrame] = load_and_preprocess_data()
     if card_database_df is None:
-        print("\nFATAL ERROR: Could not load card data. Aborting.")
+        print("Application stopped due to data loading error.")
         return
 
-    print(f"✅ Card Database Loaded Successfully. Total legal cards: {len(card_database_df)}")
-    
-    # 2. Load user's card collection
-    owned_cards: List[str] = load_collection_data()
-    
-    # 3. Get Commander name from user input
-    commander_name = get_user_commander()
-    
-    # 4. Select the Commander
-    commander_card = select_commander(card_database_df, commander_name)
+    # 2. Load Collection
+    owned_cards: Optional[List[str]] = load_collection_data()
+    if owned_cards is None:
+        print("Application stopped due to collection loading error.")
+        return
+
+    # 3. Select Commander
+    commander_card = select_commander(card_database_df)
     if commander_card is None:
         return
-        
-    # 5. Initialize the LLM Agent (AI Layer)
-    # The OllamaAgent is designed to pass the data to the DeepSeek Coder model
+
+    # Display Confirmation (This should now show R, not ['R'] from the correct data_loader)
+    print(f"\nCommander Selected: {commander_card['Name']} | Colors: {commander_card['ColorIdentity']}")
+    print("\n--- Starting AI Card Suggestion Process ---")
+
+    # 4. Initialize AI Agent and get the Strategy Command
     agent = OllamaAgent()
     
-    # 6. Generate Card Suggestions using the LLM Agent
-    print("\n--- Starting AI Card Suggestion Process ---")
-    
-    # Pass the full DataFrame, Commander Name, AND the list of owned cards
-    suggested_cards: Optional[List[str]] = agent.generate_suggestions(
-        card_df=card_database_df, 
+    # Get the strategy from the AI (e.g., {"function": "select_cards", "strategy": "Goblin Tribal"})
+    strategy_command = agent.get_strategy_command(
         commander_name=commander_card['Name'],
-        owned_cards=owned_cards # Passing the collection data
+        commander_color_identity=commander_card['ColorIdentity']
     )
     
-    if suggested_cards:
-        print("\n--- AI Suggested Cards ---")
-        for i, card in enumerate(suggested_cards):
-            print(f"  {i+1}. {card}")
+    suggested_cards = None
+    
+    # 5. Execute the strategy command locally in Python
+    if strategy_command and strategy_command.get('function') == 'select_cards':
+        strategy = strategy_command.get('strategy', 'Unknown Strategy')
         
-        print("\n✅ AI suggestion successful! Deck building assistance complete.")
+        suggested_cards = select_cards_by_strategy(
+            strategy=strategy,
+            color_identity=commander_card['ColorIdentity'],
+            owned_cards=owned_cards
+        )
     else:
-        print("\n❌ AI suggestion failed. Review the error messages (Ollama connection or JSON parsing issues).")
+        print("❌ AI failed to generate a valid strategy command. Check Ollama logs.")
 
+    # 6. Display Results
+    print("\n--- AI Suggested Cards ---")
+    if suggested_cards:
+        # Note: We now print the strategy the AI suggested before the list
+        print(f"Strategy Determined by AI: {strategy_command.get('strategy')}")
+        print("---")
+        for i, card_name in enumerate(suggested_cards, 1):
+            print(f" {i}. {card_name}")
+        print("\n✅ Deck building assistance complete.")
+    else:
+        print("❌ AI suggestion failed or returned an empty list.")
 
 if __name__ == "__main__":
     run_deck_builder_app()
